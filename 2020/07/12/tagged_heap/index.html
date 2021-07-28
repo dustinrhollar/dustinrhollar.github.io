@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="renderer" content="webkit">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>
+        Maple Engine Development
+    </title>
+    
+<link rel="stylesheet" href="/libs/highlight/styles/monokai-sublime.css">
+
+    
+<link rel="stylesheet" href="/libs/font-awesome/css/font-awesome.min.css">
+
+    
+<link rel="stylesheet" href="/css/style.css">
+
+<meta name="generator" content="Hexo 5.4.0"></head>
+
+<body id="bodyx">
+    <div class="hd posts">
+    <a href="/index.html"><i class="fa fa-reply replay-btn" aria-hidden="true"></i></a>
+    <div class="post-title">
+        <p>
+            Tagged Heap Allocator
+        </p>
+        <hr>
+    </div>
+    <div class="post-content">
+        <h1 id="Introduction"><a href="#Introduction" class="headerlink" title="Introduction"></a>Introduction</h1><p>When designing Maple’s memory management system, I identified two types of memory use cases: global memory and transient memory. Global memory allocations are meant to stick around for a while, such as the Asset or Resource managers. Transient memory is for allocations that occur on a frame-by-frame basis. This is the type of memory you might need for a temporary string or when copying global data into frame local memory. This blog post is going to be primarily the system I am using to handle transient memory.</p>
+<h1 id="Linear-Allocators"><a href="#Linear-Allocators" class="headerlink" title="Linear Allocators"></a>Linear Allocators</h1><p>Transient memory allocations need to be blazingly fast to acquire and release memory, while also making sure memory fragmentation is minimized. It would be convenient if I could use an “allocate and forget strategy” with regards to transient memory, but I could not rely on built-in C++ features like constructors and destructors (these features are a pain to work with when managing memory yourself). With this in mind, I first went with a Linear Allocator. This type of allocator is probably one of the most simple to understand: you have a pointer to the start of the memory, a pointer to the current location in the memory allocation, and the size of the allocation.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">linear_allocator</span></span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    <span class="keyword">void</span> *Start;</span><br><span class="line">    <span class="keyword">void</span> *Brkp;</span><br><span class="line">    u64   Size;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>Allocations from a linear allocator are simple - move the Brkp pointer forward by the requested amount.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">void</span>* <span class="title">LinearAllocatorAlloc</span><span class="params">(linear_allocator *Allocator, u64 ReqSize)</span> </span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">if</span> (Allocator-&gt;Brkp + ReqSize &gt; Allocator-&gt;Start + Allocator-&gt;Size)</span><br><span class="line">    &#123;</span><br><span class="line">        <span class="keyword">return</span> <span class="literal">NULL</span>;</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">void</span> *Result = Allocator-&gt;Brkp;</span><br><span class="line">    Allocator-&gt;Brkp += ReqSize;</span><br><span class="line">    <span class="keyword">return</span> Result;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+<p>One of the unique properties of a Linear Allocator is that the entire allocation block is reset and individual allocations cannot be freed.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">LinearAllocatorFree</span><span class="params">(linear_allocator *Allocator)</span> </span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    Allocator-&gt;Brkp = Allocator-&gt;Start;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>This setup is perfect for handling simple cases of frame memory: allocations are pointer arithmetic and there is only a single free at the end of a frame. This is good for gameplay programmers since they don’t have to care about managing memory throughout the lifetime of a frame.</p>
+<p>The unfortunate part about the linear allocator is that it is too simple for multithreaded systems. A naive approach is to share a frame’s linear allocator across multiple threads, but that defeats the purpose of having fast allocations! Locking a resource for safe memory access is rather expensive, so having a shared allocator for a frame is not a good idea.</p>
+<p>The next logical step is to have a pool of allocators for each thread to use. When a thread is assigned a job for a frame, it grabs an allocator if it does not already have one, executes its job, and the allocator is released by the thread when the frame ends. This approach gets especially complex because threads then need to be able to detect when an allocator needs to be released. This problem is further exacerbated when you allow for multiple frames to be processed at the same time.</p>
+<p>To briefly recap, Linear Allocators are great for fast allocations where freeing the individual allocations is not important. However, this type of memory allocator is too simplistic to handle multithreaded systems. Threads having to track when an allocator needs to be released and the sheer amount of individual allocators required makes this strategy overly complex for the problem it is trying to solve.</p>
+<h1 id="Introducing-the-Tagged-Heap"><a href="#Introducing-the-Tagged-Heap" class="headerlink" title="Introducing the Tagged Heap"></a>Introducing the Tagged Heap</h1><p>When I was researching different approaches to design a multithreaded system, I came across a GDC talk by Naughty Dog discussing how they  multithreaded their engine. One of the core allocators used for their engine was the Tagged Heap.</p>
+<p>A Tagged Heap is a combination of a Pool and Linear Allocator with a couple of twists added in. First, a user specifies a size for an allocation, so that the Tagged Heap can split its memory pool into blocks of that size. These blocks of memory are called tagged_heap_block and are treated exactly like miniature Linear Allocators.</p>
+<p>In order to provide ownership to a tagged block, a tag has to be specified. A tag can be whatever you want it to be, but for me, I packed several values into a 64 bit integer to guarantee the tag will always be unique. The Tagged Heap maintains a list of active tags and their associated block allocations. Block allocations are tracked through a bitfield, making it rather straightforward to free all allocations owned by a tag.</p>
+<p>The following structure shows the implementation of the tagged heap.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">tagged_heap</span></span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    <span class="comment">/* Memory information */</span></span><br><span class="line">    <span class="keyword">void</span>            *CoreMemory;</span><br><span class="line">    u64              MemorySize;</span><br><span class="line">    u64              BlockSize;</span><br><span class="line">    <span class="comment">/* Bitfield to track used and unused allocations */</span></span><br><span class="line">    bit_list         Track;</span><br><span class="line">    <span class="comment">/* AllocationList the active tags in the heap using a simple list */</span></span><br><span class="line">    tagged_heap_tag *ActiveTags;</span><br><span class="line">    u32              ActiveTagsCount;</span><br><span class="line">    u32              MaxActiveTags;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<h1 id="Tags"><a href="#Tags" class="headerlink" title="Tags"></a>Tags</h1><p>A tag_id packs the frame number and a unique id ino a single 64 bit integer. 8 bits of padding are reserved for future use.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">tag_id</span></span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    i64 Frame:<span class="number">48</span>;</span><br><span class="line">    i64 Id:<span class="number">8</span>;</span><br><span class="line">    i64 Padding:<span class="number">8</span>; <span class="comment">/* reserved space for future use */</span></span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>The Frame member is the frame number the tag is assigned to. Since I plan to execute multiple frames at the same time, I need to be able to find tags based on their frame number. The Id member signifies the tag’s usage. For example, if a tag has an Id of 0, then that tag is for allocations used in the platform layer.</p>
+<p>Multiple allocations can share the same tag, which is especially useful when you don’t know how much memory a task will require. In the past, I simply over allocated the memory and left a note to my future self to profile the actual amount of memory used. Over allocation works all and well when prototyping a system, but ends up creating more work for myself in the future when I start enforcing memory constraints on individual systems. Assigning multiple allocations to a tag means that when a block is used up, I can replace the full block with a new one without worrying about memory leaks. The Tagged Heap keeps track of all acquired allocations, so it will remember to reset the full block.</p>
+<h1 id="Bit-Fields"><a href="#Bit-Fields" class="headerlink" title="Bit Fields"></a>Bit Fields</h1><p>The Tagged Heap tracks allocations in two places: allocations requested from the memory pool and allocations associated with a tag. In both cases, allocations are represented as a bit field.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">bitlist</span> </span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    u64 *Bits;</span><br><span class="line">    u8   Count;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>The Bits member is an array of 64 bit integers. The reason why the length of the array is not known at compile time is because the length is dependent on the size of the memory pool and size of the block allocations. Since the length is usage dependent, I didn’t want to impose unnecessary restrictions on myself.</p>
+<p>From here on out, the value of each integer in the bitlist is not actually important since what I care about is the individual bits. A bit corresponds to the block index in the tagged heap’s memory pool.</p>
+<p><img src="/images/bitlist.png"></p>
+<p>bit png set to zero means the block at that index is not used, and a bit set to one is a block that is owned by a tag. Representing used allocations as a set of bits makes it very simple to track and free groups of allocations. One of the major problems that emerged from the multithreaded design was tracking multiple Linear Allocators for a single frame. The tag_id partially solves the problem because it groups allocations together, but doesn’t actually solve the issue of when these allocations need to be released. Having a bitfield solves the rest of this problem: a tag can be given a bit mask that tracks the allocations it owns. When a tag needs to release its memory, all it has to do is use the bit mask to clear the bits in the main bitfield managed by the Tagged Heap.</p>
+<h1 id="Retrieving-Tagged-Blocks"><a href="#Retrieving-Tagged-Blocks" class="headerlink" title="Retrieving Tagged Blocks"></a>Retrieving Tagged Blocks</h1><p>One of the more complex operations for the Tagged Heap is finding open blocks.  The following code demonstrates the process that I used.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br></pre></td><td class="code"><pre><span class="line">u64 Bitset;</span><br><span class="line"><span class="keyword">for</span> (u32 i = <span class="number">0</span>; i &lt; TaggedHeap-&gt;AllocationList.NumInts; ++i)</span><br><span class="line">&#123;</span><br><span class="line">    Bitset = ~TaggedHeap-&gt;AllocationList.Bits[i];</span><br><span class="line">    u32 BitIdx = PlatformCtzl(Bitset);</span><br><span class="line">    <span class="keyword">if</span> (BitIdx) </span><br><span class="line">    &#123;</span><br><span class="line">        u32 Idx = i * <span class="number">64</span> + BitIdx;</span><br><span class="line">        <span class="keyword">char</span> *BlockStart = (<span class="keyword">char</span>*)TaggedHeap-&gt;Start + Idx * TaggedHeap-&gt;BlockSize;</span><br><span class="line">        <span class="comment">/* ... set up the heap block */</span></span><br><span class="line">        </span><br><span class="line">        <span class="comment">/* toggle the bit in the main allocation mask in the tagged heap */</span></span><br><span class="line">        BIT_TOGGLE_1(TaggedHeap-&gt;AllocationList.Bits[i], Bit);</span><br><span class="line">        <span class="comment">/* toggle the bit for the tag */</span></span><br><span class="line">        BIT_TOGGLE_1(HeapTag-&gt;AllocationsMask.Bits[i], Bit);</span><br><span class="line">        <span class="keyword">break</span>;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>The important part of this process is the PlatformCtzl function. PlatformCtzl is a wrapper around platform dependent code that computes the number of zeros trailing the first bit set to one. On Linux I used the GCC compiler intrinsic,  __builtin_ctzl, and on Windows, _BitScanForward64.</p>
+<p>Before PlatformCtzl could be called, the value had to be negated. This is because I want to find the first unset bit, rather than the first set bit. Negating the bitfield allows me to mark all used allocations as zeros and unused allocations as ones. This allows for PlatformCtzl to find the first unused block rather than the first used block.</p>
+<h1 id="Releasing-Tags"><a href="#Releasing-Tags" class="headerlink" title="Releasing Tags"></a>Releasing Tags</h1><p>A user cannot release tagged heap blocks individually, but must release the entire tag instead. In order to do this, the Tagged Heap maintains a list of tagged_heap_tag.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">tagged_heap_tag</span></span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    tag_id   Id;</span><br><span class="line">    bit_list AllocationsMask;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure>
+
+<p>The AllocationsMask member represents the allocations from the Tagged Heap memory pool that belongs to the tag. When a tag is freed, the mask is used to clear the corresponding bits in the Tagged Heap’s bitfield.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">ClearBitfield</span><span class="params">(bit_list *Source, bit_list *Mask)</span>    </span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">for</span> (u8 Bitset = <span class="number">0</span>; Bitset &lt; Mask-&gt;NumInts; ++Bitset)</span><br><span class="line">        Source-&gt;Bits[Bitset] &amp;= ~Mask-&gt;Bits[Bitset];</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h1 id="Tagged-Heap-Block"><a href="#Tagged-Heap-Block" class="headerlink" title="Tagged Heap Block"></a>Tagged Heap Block</h1><p>There’s actually not much to this structure that hasn’t already been discussed.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">struct</span> <span class="title">tagged_heap_block</span></span></span><br><span class="line"><span class="class">&#123;</span></span><br><span class="line">    <span class="keyword">void</span> *Start;</span><br><span class="line">    <span class="keyword">void</span> *Brkp;</span><br><span class="line">    u64   Size;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<p>In fact, this structure is identical to the Linear Allocator discussed above. The intended use case of a Tagged Heap Block is to use it exactly as I would a Linear Allocator. The main difference between the two is that the Tagged Heap Block is managed by a tag id.</p>
+<p>The API for acquiring and using a Tagged Heap Block is rather straightforward.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/* </span></span><br><span class="line"><span class="comment"> * Retrieve a block based on a tag. If there are no allocations with this tag,</span></span><br><span class="line"><span class="comment"> * then the tag is added to the tagged_heap_tag list that is managed by the Tagged Heap.</span></span><br><span class="line"><span class="comment">*/</span></span><br><span class="line"><span class="function">tagged_heap_block <span class="title">TaggedHeapRequestAllocation</span><span class="params">(tagged_heap *TaggedHeap, <span class="keyword">tag_id_t</span> Tag)</span></span>;</span><br><span class="line"><span class="comment">/* Release all allocations associated with a tag */</span></span><br><span class="line"><span class="function"><span class="keyword">void</span> <span class="title">TaggedHeapReleaseAllocation</span><span class="params">(tagged_heap *TaggedHeap, <span class="keyword">tag_id_t</span> Tag)</span></span>;</span><br><span class="line"><span class="comment">/* Allocate some memory from the Tagged Heap Block */</span></span><br><span class="line"><span class="function"><span class="keyword">void</span>* <span class="title">TaggedHeapBlockAlloc</span><span class="params">(<span class="keyword">tag_block_t</span> Block, u64 Size)</span></span>; </span><br></pre></td></tr></table></figure>
+
+<p>To make allocating memory from the Tagged Heap Block a little bit easier, I ended up wrapping the function call in a template.</p>
+<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">template</span>&lt;<span class="keyword">typename</span> T&gt; </span></span><br><span class="line"><span class="function">T* <span class="title">halloc</span><span class="params">(<span class="keyword">tag_block_t</span> Block, u32 NumElements)</span></span></span><br><span class="line"><span class="function"></span>&#123;</span><br><span class="line">    <span class="keyword">return</span> (T*)TaggedHeapBlockAlloc(Block, <span class="keyword">sizeof</span>(T) * NumElements);</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>
+
+<h1 id="Final-Thoughts"><a href="#Final-Thoughts" class="headerlink" title="Final Thoughts"></a>Final Thoughts</h1><p>A Tagged Heap ended up being the exact data structure I was looking for that would handle a multithreaded system. The main problems I needed to solve were:</p>
+<ul>
+<li>Threads needed to have thread local memory allocations to reduce synchronization locks.</li>
+<li>Temporary memory for a frame needs to be fast to allocate and free. </li>
+<li>Threads should have to do little to no state tracking on the allocators it is using. </li>
+</ul>
+<p>The Tagged Heap allowed for an easy way to manage multiple Linear Allocators that had to be grouped together. Since the only free that needed to occur in a frame was when the frame finished executing, a Tagged Heap could simply clear all allocations with a bitmask using the frame’s tag id. </p>
+<p>One tricky problem that is introduced by the Tagged Heap is the size of block allocations. One strategy utilized by Naughty Dog was to use a size equal to that of a large 2MB (page on the PS4). The idea behind this was to reduce the number of page faults that could occur while accessing the allocations. However, I have yet to figure out a good way to enable large page support, so I am stuck with the standard size of a page (4KB). For now, I have set the allocation size to be 2MB (I find that 4KB is just too small), and plan to look at enabling large page support in the future.</p>
+<p>If you are curious about the GDC talk by Naughty Dog, you can find the here [talk].</p>
+<p>Until next time,<br>Dustin Hollar</p>
+
+    </div>
+
+    
+</div>
+    <div class="footer" id="footer">
+    <p>Copyright © 2020 <a class="flink" target="_blank" rel="noopener" href="https://hexo.io">Hexo</a>-<a class="flink" target="_blank" rel="noopener" href="https://github.com/sanjinhub/hexo-theme-geek">Geek</a>.
+        <label class="el-switch el-switch-green el-switch-sm" style="vertical-align: sub;">
+            <input type="checkbox" name="switch" id="update_style">
+            <span class="el-switch-style"></span>
+        </label>
+<!--         <script type="text/javascript">
+        var cnzz_protocol = (("https:" == document.location.protocol) ? "https://" : "http://");
+        document.write(unescape("%3Cspan id='cnzz_stat_icon_1278548644'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "v1.cnzz.com/stat.php%3Fid%3D1278548644%26show%3Dpic1' type='text/javascript'%3E%3C/script%3E"));
+        </script> -->
+    </p>
+</div>
+<input type="hidden" id="web_style" value="black">
+<input type="hidden" id="valine_appid" value="">
+<input type="hidden" id="valine_appKey" value="">
+
+<script src="/libs/jquery.min.js"></script>
+
+
+<script src="/libs/highlight/highlight.pack.js"></script>
+
+<script src='//cdn.jsdelivr.net/npm/valine@1.3.10/dist/Valine.min.js'></script>
+
+<script src="/js/js.js"></script>
+
+<style type="text/css">
+.v * {
+    color: #698fca;
+}
+
+.v .vlist .vcard .vhead .vsys {
+    color: #3a3e4a;
+}
+
+.v .vlist .vcard .vh .vmeta .vat {
+    color: #638fd5;
+}
+
+.v .vlist .vcard .vhead .vnick {
+    color: #6ba1ff;
+}
+
+.v a {
+    color: #8696b1;
+}
+
+.v .vlist .vcard .vhead .vnick:hover {
+    color: #669bfc;
+}
+</style>
+</body>
+
+</html>
